@@ -4,7 +4,7 @@
 //
 // DESCRIPTION:
 //    Visits all functions in a module, prints their names, the number of
-//    arguments and function blocks via stderr. Strictly speaking, this is an analysis pass (i.e.
+//    arguments, function blocks and instructions via stderr. Strictly speaking, this is an analysis pass (i.e.
 //    the functions are not modified). However, in order to keep things simple
 //    there's no 'print' method here (every analysis pass should implement it).
 //
@@ -40,7 +40,7 @@ void visitor(Function &F) {
 
       // Iterate over instructions in the basic block
       for (Instruction &I : BB) {
-        errs() << "(llvm-tutor)        Instruction: " << I << "\n";
+        errs() << "(llvm-tutor)    Instruction: " << I << "\n";
       }
     }
 }
