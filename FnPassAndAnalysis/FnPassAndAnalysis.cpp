@@ -37,7 +37,6 @@ void visitor(Function &F) {
     // Iterate over basic blocks in the function
     for (BasicBlock &BB : F) {
       errs() << "(llvm-tutor)    Basic Block: " << BB.getName() << "\n";
-
       // Iterate over instructions in the basic block
       for (Instruction &I : BB) {
         errs() << "(llvm-tutor)    Instruction: " << I << "\n";
