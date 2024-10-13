@@ -16,7 +16,7 @@ if("${LLVM_VERSION_MAJOR}" VERSION_LESS 18)
   message(FATAL_ERROR "Found LLVM ${LLVM_VERSION_MAJOR}, but need LLVM 18 or above")
 endif()
 
-# FnPassAndAnalysis includes headers from LLVM - update the include paths accordingly
+# OmpDependencyFinder includes headers from LLVM - update the include paths accordingly
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
 
 #===============================================================================
@@ -33,9 +33,9 @@ endif()
 #===============================================================================
 # 3. ADD THE TARGET
 #===============================================================================
-add_library(FnPassAndAnalysis SHARED FnPassAndAnalysis.cpp)
+add_library(OmpDependencyFinder SHARED OmpDependencyFinder.cpp)
 
 # Allow undefined symbols in shared objects on Darwin (this is the default
 # behaviour on Linux)
-target_link_libraries(FnPassAndAnalysis
+target_link_libraries(OmpDependencyFinder
   "$<$<PLATFORM_ID:Darwin>:-undefined dynamic_lookup>")
