@@ -19,6 +19,8 @@ endif()
 # OmpDependencyFinder includes headers from LLVM - update the include paths accordingly
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
 
+add_definitions(-DENABLE_ASSERTIONS)
+
 #===============================================================================
 # 2. LLVM-TUTOR BUILD CONFIGURATION
 #===============================================================================

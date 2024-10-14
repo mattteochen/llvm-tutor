@@ -18,6 +18,7 @@
 //
 // License: MIT
 //=============================================================================
+#include <cassert>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -55,6 +56,21 @@ std::unordered_set<uint8_t> inDepsFlags = {1, 3};
 
 std::unordered_set<uint8_t> outDepsFlags = {2};
 
+namespace utils {
+template <typename... T>
+void log(raw_fd_ostream &out, uint8_t indent, uint8_t noNewLines, T &&...args) {
+  std::string indentStr = "";
+  for (uint8_t i = 0; i < indent; ++i) {
+    indentStr += ' ';
+  }
+  out << indentStr;
+  ((out << args << " "), ...); // Fold expression with proper << expansion
+  for (uint8_t i = 0; i < noNewLines; ++i) {
+    out << "\n";
+  }
+}
+} // namespace utils
+
 bool isTarget(Instruction const &inst, const uint8_t flag) {
   StringRef instruction_name = inst.getName();
   StringRef opcode_name = inst.getOpcodeName();
@@ -69,6 +85,10 @@ bool isTarget(Instruction const &inst, const uint8_t flag) {
   return false;
 }
 
+/// Retrive the instructions wrapping a task creation and submission
+/// A single basic block may contain multiple task creation instructions
+/// @param block A basic block
+/// @return A list of possbile instructions containing task creation
 std::vector<std::vector<Instruction *>>
 taskWithDepsInstructions(BasicBlock &block) {
   bool inside = 0;
@@ -98,7 +118,7 @@ bool GEPIsArrayOfSpecificStruct(const GetElementPtrInst *GEP,
 
   // Check if the source type is an array
   if (sourceType->isArrayTy()) {
-    errs() << "  The type being indexed is an array.\n";
+    utils::log(errs(), 2, 1, "The type being indexed is an array");
     // Get the element type of the array
     ArrayType *arrayType = cast<ArrayType>(sourceType);
     Type *elementType = arrayType->getElementType();
@@ -109,25 +129,29 @@ bool GEPIsArrayOfSpecificStruct(const GetElementPtrInst *GEP,
 
       // Compare the struct name with the one we are looking for
       if (structType->getName().data() == structName) {
-        errs() << "  This GEP is accessing an array of the struct: "
-               << structName << "\n";
+        utils::log(errs(), 2, 1,
+                   "This GEP is accessing an array of the struct:", structName);
         return true;
       } else {
-        errs() << "  This GEP is accessing an array of the struct different "
-                  "from the target struct: "
-               << structType->getName() << "\n";
+        utils::log(errs(), 2, 1,
+                   "This GEP is accessing an array of the struct different "
+                   "from the target struct: ",
+                   structType->getName());
       }
     }
   } else {
-    errs() << "  The type being indexed is not an array.\n";
+    utils::log(errs(), 2, 1, "The type being indexed is not an array");
   }
   return false;
 }
 
+/// Find the GEP reference usage and print it
+/// @param GEP A pointer to a @ref llvm::GetElementPtrInst instance
 void GEPUses(const GetElementPtrInst *GEP) {
-  errs() << "  Analyzing uses of GEP instruction:\n";
-  GEP->print(errs());
-  errs() << "\n";
+  std::string stringBuff;
+  raw_string_ostream stream(stringBuff);
+  GEP->print(stream);
+  utils::log(errs(), 2, 1, "Analyzing uses of GEP instruction: ", stringBuff);
 
   // Iterate through all uses of the GEP instruction
   for (const Use &U : GEP->uses()) {
@@ -136,34 +160,44 @@ void GEPUses(const GetElementPtrInst *GEP) {
 
     // Check if the GEP result is used in a store instruction
     if (const StoreInst *storeInst = dyn_cast<StoreInst>(user)) {
-      errs() << "  GEP result is being stored in memory:\n";
-      storeInst->print(errs());
-      errs() << "\n";
+      utils::log(errs(), 2, 1, "GEP result is being stored in memory");
+      // storeInst->print(errs());
+      // utils::log(errs(), 2, "\n");
     }
     // Check if the GEP result is used in a load instruction
     else if (const LoadInst *loadInst = dyn_cast<LoadInst>(user)) {
-      errs() << "  GEP result is being loaded from memory:\n";
-      loadInst->print(errs());
-      errs() << "\n";
+      utils::log(errs(), 2, 1, "GEP result is being loaded from memory");
+      // loadInst->print(errs());
+      // utils::log(errs(), 2, "\n");
     }
     // Check if the GEP result is passed as an argument to a function call
     else if (const CallInst *callInst = dyn_cast<CallInst>(user)) {
-      errs()
-          << "  GEP result is being used as an argument in a function call:\n";
-      callInst->print(errs());
-      errs() << "\n";
+      utils::log(errs(), 2, 1, "GEP result is being used in a function call");
+      // callInst->print(errs());
+      // utils::log(errs(), 2, "\n");
     }
     // Handle other types of instructions
     else {
-      errs() << "  GEP result is being used in:\n";
-      user->print(errs());
-      errs() << "\n";
+      utils::log(errs(), 2, 1, "Not recognized use");
+      // errs()  << "  GEP result is being used in:\n";
+      // user->print(errs());
+      // errs() << "\n";
     }
   }
 }
 
+/// Define the store instruction data type
+/// Used in @ref GEPStoreUses
 enum StoreType { PointerStore, ValueStore };
 
+/// Retrieve omp dependency struct pointer retrieval instruction actions to
+/// detect omp dependencies This function is specialized on IR of the omp task
+/// dependency scheduling
+/// @tparam T The type of storage we are looking for. @ref
+/// StoreType::PointerStore for dependencies souces and @ref
+/// StoreType::ValueStore for dependencies types
+/// @param GEP A pointer to a get element pointer instance
+/// @return The label stored in the GEP reference
 template <StoreType T> int GEPStoreUses(const GetElementPtrInst *GEP) {
   // Retrieve the label of a pointer
   auto getPtrLabel = [](const std::string &str) {
@@ -204,9 +238,13 @@ template <StoreType T> int GEPStoreUses(const GetElementPtrInst *GEP) {
     return label;
   };
 
-  errs() << "  Analyzing store uses of GEP instruction:\n";
-  GEP->print(errs());
-  errs() << "\n";
+  std::string stringBuff;
+  raw_string_ostream stream(stringBuff);
+
+  GEP->print(stream);
+  utils::log(errs(), 2, 1,
+             "Analyzing store uses of GEP instruction: ", stringBuff);
+  stringBuff.clear();
 
   // Iterate through all uses of the GEP instruction
   for (const Use &U : GEP->uses()) {
@@ -219,56 +257,77 @@ template <StoreType T> int GEPStoreUses(const GetElementPtrInst *GEP) {
       // TODO: can this be done in a easier way?
       // Retrieve the label being store
       const Value *storedValue = storeInst->getValueOperand();
-      errs() << "  Stored value" << *storedValue << "\n";
-      std::string outputStr;
-      raw_string_ostream stream(outputStr);
       storedValue->print(stream);
+      utils::log(errs(), 2, 1, "Stored value: ", stringBuff);
 
       std::string label;
       if constexpr (T == StoreType::PointerStore) {
-        label = getPtrLabel(outputStr);
+        label = getPtrLabel(stringBuff);
       } else {
-        label = getValueLabel(outputStr);
+        label = getValueLabel(stringBuff);
       }
+      stringBuff.clear();
       return std::stoi(label);
     }
   }
   return -1;
 }
 
-// Find an omp dependency from a list of instructions containing a sequnce of
-// GEP calls
-void GEPDependencyFinder(std::vector<Instruction *> instrunctions) {
+/// Find an omp dependency from a list of instructions containing a sequnce of
+/// GEP calls. Other instructions might be present inside the input sequence and
+/// are filtered out.
+/// @param instructions A @ref std::vector of @ref llvm::Instruction
+/// @param targetStructName The struct name to search
+template <bool ShowInbounds = false>
+void GEPDependencyFinder(std::vector<Instruction *> instrunctions,
+                         const std::string &targetStructName) {
   int foundDepsLabel = -1;
+  std::string stringBuff = "";
+  raw_string_ostream stream(stringBuff);
+
   for (auto &inst : instrunctions) {
     if (auto *GEP = dyn_cast<GetElementPtrInst>(inst)) {
-      errs() << "Found a GetElementPtr instruction:\n";
-      GEP->print(errs());
-      errs() << "\n";
+      GEP->print(stream);
+      utils::log(errs(), 2, 1,
+                 "Found a GetElementPtr instruction: ", stringBuff);
+      stringBuff.clear();
 
       // Optionally, check if it's 'inbounds'
-      if (GEP->isInBounds()) {
-        errs() << "  This GEP instruction is 'inbounds'.\n";
+      if constexpr (ShowInbounds) {
+        if (GEP->isInBounds()) {
+          utils::log(errs(), 2, 1, "GEP instruction is 'inbounds'");
+        }
       }
 
-      if (GEPIsArrayOfSpecificStruct(GEP, targetOmpDepsStructName)) {
-        // Find uses of GEP if the last operand is zero (the last index accesses
-        // the struct fields, and we need to access the first field)
-        const auto lastIndex = GEP->getNumOperands() - 1;
+      // Check if the GEP does access the struct of interest
+      if (GEPIsArrayOfSpecificStruct(GEP, targetStructName)) {
+        // kaixi: Do refer to technical docs for these accesses
+        auto lastIndex = GEP->getNumOperands();
+        // We do expect structs with more than one field
+#ifdef ENABLE_ASSERTIONS
+        assert(lastIndex > 0);
+#endif
+        lastIndex--;
+
         Value *value = GEP->getOperand(lastIndex);
         if (const ConstantInt *CI = dyn_cast<ConstantInt>(value)) {
           const auto value = CI->getValue();
           if (value == 0) {
-            errs() << "  GEP instruction on the dependency source field. Finding its "
-                      "source...\n";
+            utils::log(errs(), 2, 1,
+                       "GEP instruction on the dependency source field");
             const int label = GEPStoreUses<StoreType::PointerStore>(GEP);
             foundDepsLabel = label;
           } else if (value == 2) {
-            errs() << "  GEP instruction on the dependency type field. Finding its "
-                      "value...\n";
+            utils::log(errs(), 2, 1,
+                       "GEP instruction on the dependency type field");
             const int label = GEPStoreUses<StoreType::ValueStore>(GEP);
-            errs() << "  Found a dependency. {Source: " << foundDepsLabel
-                    << ", Type: " << label << "}\n";
+
+#ifdef ENABLE_ASSERTIONS
+            assert(foundDepsLabel != -1);
+#endif
+            utils::log(errs(), 2, 1,
+                       "Found a dependency. {Source:", foundDepsLabel,
+                       ", Type:", label, "}");
           }
         }
       }
@@ -276,29 +335,35 @@ void GEPDependencyFinder(std::vector<Instruction *> instrunctions) {
   }
 }
 
-// This method implements what the pass does
+/// This method implements what the pass does
+/// @param F The @ref llvm:Function to visit
 void visitor(Function &F) {
-  errs() << "################ START OF FUNCTION ################\n\n";
-  errs() << "(llvm-tutor) Hello from: " << F.getName() << "\n";
-  errs() << "(llvm-tutor)   number of arguments: " << F.arg_size() << "\n";
+  utils::log(errs(), 0, 2,
+             "################ START OF FUNCTION ################");
+  utils::log(errs(), 0, 1, "Function name:", F.getName(),
+             "#args:", F.arg_size());
+
   // Iterate over basic blocks in the function
   for (BasicBlock &BB : F) {
-    errs() << "(llvm-tutor)    Basic Block: " << BB.getName() << "\n";
+    utils::log(errs(), 0, 1,
+               "\n################# START OF BLOCK ##################");
+    // For each basic block retrieves the instructions sequence defining a task
+    // creation and submission
     const auto parsedInstructions = taskWithDepsInstructions(BB);
-    errs() << "(llvm-tutor)    Basic Block task with deps: "
-           << parsedInstructions.size() << "\n";
+    utils::log(errs(), 1, 1,
+               "Basic Block task with deps #:", parsedInstructions.size());
 
     for (auto &i : parsedInstructions) {
-      for (auto &j : i) {
-        errs() << *j << "\n";
-      }
-      errs() << "\n################ START GEP ANALYSIS ################\n";
-      GEPDependencyFinder(i);
-      errs() << "\n################ END GEP ANALYSIS ################\n";
+      // for (auto &j : i) {
+      //   errs() << *j << "\n";
+      // }
+      GEPDependencyFinder(i, targetOmpDepsStructName);
     }
-    errs() << "################ END OF BLOCK ################\n";
+    utils::log(errs(), 0, 1,
+               "################## END OF BLOCK ###################");
   }
-  errs() << "\n################ END OF FUNCTION ################\n\n";
+  utils::log(errs(), 0, 2,
+             "\n################ END OF FUNCTION ##################");
 }
 
 // New PM implementation
@@ -336,8 +401,9 @@ llvm::PassPluginLibraryInfo getOmpDependencyFinderPlugInInfo() {
 }
 
 // This is the core interface for pass plugins. It guarantees that 'opt' will
-// be able to recognize OmpDependencyFinder when added to the pass pipeline on the
-// command line, i.e. via '-passes=fn-pass-and-analysis'
-extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
+// be able to recognize OmpDependencyFinder when added to the pass pipeline on
+// the command line, i.e. via '-passes=fn-pass-and-analysis'
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
+llvmGetPassPluginInfo() {
   return getOmpDependencyFinderPlugInInfo();
 }
