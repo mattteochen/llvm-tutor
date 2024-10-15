@@ -20,9 +20,10 @@
 //=============================================================================
 #include <cassert>
 #include <cstdint>
+#include <map>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Analysis/InlineCost.h>
@@ -44,17 +45,25 @@ using namespace llvm;
 namespace {
 
 const std::string targetOpenOmpCall = "__kmpc_omp_task_alloc";
-const std::string targetCloseOmpCall = "__kmpc_omp_task_with_deps";
+const std::string targetCloseDepsOmpCall = "__kmpc_omp_task_with_deps";
+const std::string targetCloseOmpCall = "__kmpc_omp_task";
 const std::string targetOmpDepsStructName = "struct.kmp_depend_info";
 
 constexpr uint8_t OPEN_FLAG = 0;
-constexpr uint8_t CLOSE_FLAG = 1;
+constexpr uint8_t CLOSE_FLAG_WITH_DEPS = 1;
+constexpr uint8_t CLOSE_FLAG = 2;
 
-std::unordered_map<unsigned, std::vector<unsigned>> deps;
+// key: fn ID
+// value.first: in_deps
+// value.second: out_deps
+std::map<unsigned, std::pair<std::set<unsigned>, std::set<unsigned>>>
+    dependentTasks;
 
-std::unordered_set<uint8_t> inDepsFlags = {1, 3};
+std::unordered_set<unsigned> freeTasks;
 
-std::unordered_set<uint8_t> outDepsFlags = {2};
+const std::unordered_set<uint8_t> outDepsFlags = {2, 3};
+
+const std::unordered_set<uint8_t> inDepsFlags = {1};
 
 namespace utils {
 template <typename... T>
@@ -78,6 +87,9 @@ bool isTarget(Instruction const &inst, const uint8_t flag) {
     StringRef name = CI->getCalledFunction()->getName();
     if (flag == OPEN_FLAG && name.data() == targetOpenOmpCall) {
       return true;
+    } else if (flag == CLOSE_FLAG_WITH_DEPS &&
+               name.data() == targetCloseDepsOmpCall) {
+      return true;
     } else if (flag == CLOSE_FLAG && name.data() == targetCloseOmpCall) {
       return true;
     }
@@ -99,7 +111,8 @@ taskWithDepsInstructions(BasicBlock &block) {
       instructions.clear();
       inside = 1;
       instructions.push_back(&inst);
-    } else if (inside && isTarget(inst, CLOSE_FLAG)) {
+    } else if (inside && (isTarget(inst, CLOSE_FLAG_WITH_DEPS) ||
+                          (isTarget(inst, CLOSE_FLAG)))) {
       inside = 0;
       instructions.push_back(&inst);
       blockInstructions.push_back(std::vector(instructions));
@@ -161,27 +174,18 @@ void GEPUses(const GetElementPtrInst *GEP) {
     // Check if the GEP result is used in a store instruction
     if (const StoreInst *storeInst = dyn_cast<StoreInst>(user)) {
       utils::log(errs(), 2, 1, "GEP result is being stored in memory");
-      // storeInst->print(errs());
-      // utils::log(errs(), 2, "\n");
     }
     // Check if the GEP result is used in a load instruction
     else if (const LoadInst *loadInst = dyn_cast<LoadInst>(user)) {
       utils::log(errs(), 2, 1, "GEP result is being loaded from memory");
-      // loadInst->print(errs());
-      // utils::log(errs(), 2, "\n");
     }
     // Check if the GEP result is passed as an argument to a function call
     else if (const CallInst *callInst = dyn_cast<CallInst>(user)) {
       utils::log(errs(), 2, 1, "GEP result is being used in a function call");
-      // callInst->print(errs());
-      // utils::log(errs(), 2, "\n");
     }
     // Handle other types of instructions
     else {
       utils::log(errs(), 2, 1, "Not recognized use");
-      // errs()  << "  GEP result is being used in:\n";
-      // user->print(errs());
-      // errs() << "\n";
     }
   }
 }
@@ -273,6 +277,23 @@ template <StoreType T> int GEPStoreUses(const GetElementPtrInst *GEP) {
   return -1;
 }
 
+std::string getOmpTaskEntryId(std::string const &name) {
+  unsigned i = 0;
+  // Prepend with a zero as the id will be converted to an unsigned. The first
+  // created task entry has no numeric id hence we assign it to zero
+  // TODO: check if by default clang will generate a task entry with id = 0
+  std::string res = "0";
+  // We could directly jump to the index as they all have the same prefix. But
+  // for safety let's go in this way for now
+  while (i < name.size() && (name[i] < '0' || name[i] > '9')) {
+    i++;
+  }
+  while (i < name.size()) {
+    res += name[i++];
+  }
+  return res;
+}
+
 /// Find an omp dependency from a list of instructions containing a sequnce of
 /// GEP calls. Other instructions might be present inside the input sequence and
 /// are filtered out.
@@ -282,10 +303,39 @@ template <bool ShowInbounds = false>
 void GEPDependencyFinder(std::vector<Instruction *> instrunctions,
                          const std::string &targetStructName) {
   int foundDepsLabel = -1;
+  std::string ompTaskEntryLamda = "";
   std::string stringBuff = "";
   raw_string_ostream stream(stringBuff);
 
+  utils::log(errs(), 2, 1, "\nFirst instruction:", *(instrunctions[0]));
+  utils::log(errs(), 2, 1,
+             "Last instruction:", *(instrunctions[instrunctions.size() - 1]));
+
   for (auto &inst : instrunctions) {
+    if (CallInst *ompTaskAPICall = dyn_cast<llvm::CallInst>(inst)) {
+      auto calledFnName = ompTaskAPICall->getCalledFunction()->getName().str();
+      // It's not either a task creation open call or close call
+      if ((calledFnName != targetOpenOmpCall) &&
+          (calledFnName != targetCloseDepsOmpCall) &&
+          (calledFnName != targetCloseOmpCall)) {
+        continue;
+      } else if (calledFnName == targetOpenOmpCall) {
+        // Extract the executed lamda reference
+        const auto noOperands = ompTaskAPICall->getNumOperands();
+        // The task entry lambda argmument is stored in the -2 index
+        Value *ompTaskEntryLambdaArg =
+            ompTaskAPICall->getArgOperand(noOperands - 2);
+        utils::log(errs(), 2, 1,
+                   "Lambda called name:", ompTaskEntryLambdaArg->getName());
+        ompTaskEntryLamda = ompTaskEntryLambdaArg->getName().str();
+        continue;
+      } else if (calledFnName == targetCloseOmpCall) {
+        // When encountering a closing API call, if it's a task with no deps
+        // save it
+        freeTasks.insert(std::stoi(getOmpTaskEntryId(ompTaskEntryLamda)));
+      }
+    }
+
     if (auto *GEP = dyn_cast<GetElementPtrInst>(inst)) {
       GEP->print(stream);
       utils::log(errs(), 2, 1,
@@ -325,9 +375,26 @@ void GEPDependencyFinder(std::vector<Instruction *> instrunctions,
 #ifdef ENABLE_ASSERTIONS
             assert(foundDepsLabel != -1);
 #endif
+            // We save our dependency immediately here at the end of the target
+            // GEP and not waiting for the task submission as there might be
+            // more than one dependencies creation between the task alloc call
+            // and task sumbission call.
             utils::log(errs(), 2, 1,
                        "Found a dependency. {Source:", foundDepsLabel,
                        ", Type:", label, "}");
+            if (inDepsFlags.find(label) != inDepsFlags.end()) {
+              utils::log(errs(), 2, 1,
+                         "Assigning dependentTasks. Holder:", ompTaskEntryLamda,
+                         " input dep with:", foundDepsLabel);
+              dependentTasks[std::stoi(getOmpTaskEntryId(ompTaskEntryLamda))]
+                  .first.insert(foundDepsLabel);
+            } else if (outDepsFlags.find(label) != outDepsFlags.end()) {
+              utils::log(errs(), 2, 1,
+                         "Assigning dependentTasks. Holder:", ompTaskEntryLamda,
+                         " output dep with:", foundDepsLabel);
+              dependentTasks[std::stoi(getOmpTaskEntryId(ompTaskEntryLamda))]
+                  .second.insert(foundDepsLabel);
+            }
           }
         }
       }
@@ -338,6 +405,10 @@ void GEPDependencyFinder(std::vector<Instruction *> instrunctions,
 /// This method implements what the pass does
 /// @param F The @ref llvm:Function to visit
 void visitor(Function &F) {
+  // Clear our dependentTasks holder for now as it will be only printed to
+  // standard error
+  dependentTasks.clear();
+  freeTasks.clear();
   utils::log(errs(), 0, 2,
              "################ START OF FUNCTION ################");
   utils::log(errs(), 0, 1, "Function name:", F.getName(),
@@ -350,8 +421,8 @@ void visitor(Function &F) {
     // For each basic block retrieves the instructions sequence defining a task
     // creation and submission
     const auto parsedInstructions = taskWithDepsInstructions(BB);
-    utils::log(errs(), 1, 1,
-               "Basic Block task with deps #:", parsedInstructions.size());
+    utils::log(errs(), 1, 1, "Basic Block task with dependentTasks #:",
+               parsedInstructions.size());
 
     for (auto &i : parsedInstructions) {
       // for (auto &j : i) {
@@ -362,6 +433,51 @@ void visitor(Function &F) {
     utils::log(errs(), 0, 1,
                "################## END OF BLOCK ###################");
   }
+
+  // Print our the task graph (to not be confused with OpenMP task graph)
+  utils::log(errs(), 1, 1, "\nDependency graph:");
+  std::unordered_map<unsigned, std::vector<unsigned>> depsCount;
+  for (auto &kv : dependentTasks) {
+    utils::log(errs(), 0, 1, "\nLambda name id:", kv.first);
+    utils::log(errs(), 0, 0, "In dependentTasks:");
+    for (auto &d : kv.second.first) {
+      const std::string formatted = '%' + std::to_string(d);
+      utils::log(errs(), 0, 0, formatted);
+    }
+    std::set<unsigned> uniqueParents;
+    for (auto &d : kv.second.first) {
+      for (auto &parent : depsCount[d]) {
+        uniqueParents.insert(parent);
+      }
+    }
+    if (uniqueParents.size()) {
+      utils::log(
+          errs(), 0, 1,
+          "\nThis task depends on the termination of the following parents:");
+      utils::log(errs(), 0, 0, "[");
+      for (auto &parent : uniqueParents) {
+        utils::log(errs(), 0, 0, parent);
+      }
+      utils::log(errs(), 0, 1, "]");
+    } else {
+      utils::log(errs(), 0, 1, " ");
+    }
+
+    utils::log(errs(), 0, 0, "Out dependentTasks:");
+    for (auto &d : kv.second.second) {
+      depsCount[d].push_back(kv.first);
+      const std::string formatted = '%' + std::to_string(d);
+      utils::log(errs(), 0, 0, formatted);
+    }
+  }
+
+  utils::log(errs(), 0, 1, "\nFree tasks:");
+  utils::log(errs(), 0, 0, "[");
+  for (auto &task : freeTasks) {
+    utils::log(errs(), 0, 0, task);
+  }
+  utils::log(errs(), 0, 1, "]");
+
   utils::log(errs(), 0, 2,
              "\n################ END OF FUNCTION ##################");
 }
