@@ -3,11 +3,7 @@
 //    OmpDependencyFinder.cpp
 //
 // DESCRIPTION:
-//    Visits all functions in a module, prints their names, the number of
-//    arguments, function blocks and instructions via stderr. Strictly speaking,
-//    this is an analysis pass (i.e. the functions are not modified). However,
-//    in order to keep things simple there's no 'print' method here (every
-//    analysis pass should implement it).
+//    Find the static computational graph of a OpenMP task program
 //
 // USAGE:
 //    New PM
