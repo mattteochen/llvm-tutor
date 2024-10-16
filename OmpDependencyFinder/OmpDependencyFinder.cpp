@@ -7,7 +7,8 @@
 //
 // USAGE:
 //    New PM
-//      opt -load-pass-plugin=libHelloWorld.dylib -passes="fn-pass-and-analysis"
+//      opt -load-pass-plugin=libOmpDependencyFinder.so
+//      -passes="module-pass-and-analysis"
 //      `\`
 //        -disable-output <input-llvm-file>
 //
@@ -58,6 +59,8 @@ std::map<unsigned, std::pair<std::set<unsigned>, std::set<unsigned>>>
 
 std::unordered_map<std::string, Function *> fnCache;
 
+std::unordered_map<unsigned, std::vector<unsigned>> taskEntryInputs;
+
 std::unordered_set<unsigned> freeTasks;
 
 const std::unordered_set<uint8_t> outDepsFlags = {2, 3};
@@ -89,7 +92,8 @@ bool isTarget(Instruction const &inst, const uint8_t flag) {
     } else if (flag == CLOSE_FLAG_WITH_DEPS &&
                name.data() == targetOmpTaskSubmissionDepsName) {
       return true;
-    } else if (flag == CLOSE_FLAG && name.data() == targetOmpTaskSubmissionName) {
+    } else if (flag == CLOSE_FLAG &&
+               name.data() == targetOmpTaskSubmissionName) {
       return true;
     }
   }
@@ -158,7 +162,7 @@ bool GEPIsArrayOfSpecificStruct(const GetElementPtrInst *GEP,
 }
 
 /// Find the GEP reference usage and print it
-/// @param GEP A pointer to a @ref llvm::GetElementPtrInst instance
+/// @param GEP A pointer to a @ref GetElementPtrInst instance
 void GEPUses(const GetElementPtrInst *GEP) {
   std::string stringBuff;
   raw_string_ostream stream(stringBuff);
@@ -293,16 +297,113 @@ std::string getOmpTaskEntryId(std::string const &name) {
   return res;
 }
 
-/// Find omp dependencies from a list of instructions containing a sequnce of
-/// omp task calls. Dependencies are discovered by leveraging GEP calls which populates omp deps structs.
-/// Other instructions might be present inside the input sequence and are filtered out.
-/// @param instructions A @ref std::vector of @ref llvm::Instruction
+/// Find the inputs label to a omp task entry lambda
+/// @param I The omp task alloc instruction
+/// @return A @ref std::vector representing the inputs labels
+std::vector<unsigned> findTaskEntrypointInputs(Instruction &I) {
+  std::vector<unsigned> inputs;
+  auto cleanOperandString = [](std::string const &str) {
+    unsigned index = 0;
+    std::string cleaned = "";
+    while (index < str.size() && str[index] != '%') {
+      index++;
+    }
+    index++;
+    while (index < str.size() && str[index] >= '0' && str[index] <= '9') {
+      cleaned += str[index++];
+    }
+    return cleaned;
+  };
+
+  auto saveStore = [&cleanOperandString, &inputs](auto *storeInst,
+                                                  const unsigned index) {
+    std::string stringBuff;
+    raw_string_ostream stream(stringBuff);
+    storeInst->getOperand(index)->print(stream);
+    const auto parsedOperand = cleanOperandString(stringBuff);
+    utils::log(errs(), 2, 1,
+               "Found a store instruction linked to the omp task "
+               "allocation struct. Stored value label:",
+               parsedOperand);
+    inputs.push_back(std::stoi(parsedOperand));
+  };
+
+  if (auto *callInst = dyn_cast<CallInst>(&I)) {
+    // Check if it's a call to __kmpc_omp_task_alloc
+    assert(callInst->getCalledFunction()->getName() == targetOmpTaskAllocName);
+    Value *allocResult = callInst;
+
+    for (auto *user : allocResult->users()) {
+      if (auto *bitCastInst = dyn_cast<BitCastInst>(user)) {
+        Value *bitCastedValue = bitCastInst;
+
+        for (auto *user2 : bitCastedValue->users()) {
+          if (auto *loadInst = dyn_cast<LoadInst>(user2)) {
+            Value *loadedValue = loadInst;
+
+            // One input data case
+            // If there are multiple input data, this pattern is not valid
+            // (clang14 IR)
+            for (auto *user3 : loadedValue->users()) {
+              if (auto *storeInst = dyn_cast<StoreInst>(user3)) {
+                // Parse only the fist operand as it contains the reference we
+                // are looking for
+                saveStore(storeInst, 0);
+              }
+            }
+
+            // Multiple input data case: first input data has a different
+            // handling wrt to the subsequent ones (clang14 IR)
+            for (auto *user3 : loadedValue->users()) {
+              if (auto *gepInst =
+                      dyn_cast<GetElementPtrInst>(user3)) {
+                for (auto *user4 : gepInst->users()) {
+                  if (auto *bitCastInst2 =
+                          dyn_cast<BitCastInst>(user4)) {
+                    for (auto *user5 : bitCastInst2->users()) {
+                      if (auto *storeInst =
+                              dyn_cast<StoreInst>(user5)) {
+                        // Parse only the fist operand as it contains
+                        // the reference we are looking for
+                        saveStore(storeInst, 0);
+                      }
+                    }
+                  }
+                }
+              } else if (auto *bitCastInst3 =
+                             dyn_cast<BitCastInst>(user3)) {
+                for (auto *user6 : bitCastInst3->users()) {
+                  if (auto *storeInst =
+                          dyn_cast<StoreInst>(user6)) {
+                    // Parse only the fist operand as it contains the
+                    // reference we are looking for
+                    saveStore(storeInst, 0);
+                  }
+                }
+              }
+            }
+            break;
+          }
+        }
+        break;
+      }
+    }
+  }
+  return inputs;
+}
+
+/// Find omp dependencies from a list of instructions containing a sequnce
+/// of omp task calls. Dependencies are discovered by leveraging GEP calls
+/// which populates omp deps structs. Other instructions might be present
+/// inside the input sequence and are filtered out. This pass will save
+/// for each omp task entry lambda the relative inputs.
+/// @param instructions A @ref std::vector of @ref Instruction
 /// @param targetStructName The struct name to search
 template <bool ShowInbounds = false>
 void OmpDependenciesFinder(std::vector<Instruction *> instrunctions,
-                         const std::string &targetStructName) {
+                           const std::string &targetStructName) {
   int foundDepsLabel = -1;
-  std::string ompTaskEntryLamda = "";
+  std::string ompTaskEntryLamdaName = "";
   std::string stringBuff = "";
   raw_string_ostream stream(stringBuff);
 
@@ -311,7 +412,7 @@ void OmpDependenciesFinder(std::vector<Instruction *> instrunctions,
              "Last instruction:", *(instrunctions[instrunctions.size() - 1]));
 
   for (auto &inst : instrunctions) {
-    if (CallInst *ompTaskAPICall = dyn_cast<llvm::CallInst>(inst)) {
+    if (CallInst *ompTaskAPICall = dyn_cast<CallInst>(inst)) {
       auto calledFnName = ompTaskAPICall->getCalledFunction()->getName().str();
       // It's not either a task creation open call or close call
       if ((calledFnName != targetOmpTaskAllocName) &&
@@ -326,12 +427,18 @@ void OmpDependenciesFinder(std::vector<Instruction *> instrunctions,
             ompTaskAPICall->getArgOperand(noOperands - 2);
         utils::log(errs(), 2, 1,
                    "Lambda called name:", ompTaskEntryLambdaArg->getName());
-        ompTaskEntryLamda = ompTaskEntryLambdaArg->getName().str();
+        ompTaskEntryLamdaName = ompTaskEntryLambdaArg->getName().str();
+
+        // Find the task inputs. Dependencies data will figure in this
+        // input vector
+        taskEntryInputs[std::stoi(getOmpTaskEntryId(ompTaskEntryLamdaName))] =
+            findTaskEntrypointInputs(*inst);
+
         continue;
       } else if (calledFnName == targetOmpTaskSubmissionName) {
-        // When encountering a closing API call, if it's a task with no deps
-        // save it
-        freeTasks.insert(std::stoi(getOmpTaskEntryId(ompTaskEntryLamda)));
+        // When encountering a closing API call, if it's a task with no
+        // deps save it
+        freeTasks.insert(std::stoi(getOmpTaskEntryId(ompTaskEntryLamdaName)));
       }
     }
 
@@ -374,24 +481,26 @@ void OmpDependenciesFinder(std::vector<Instruction *> instrunctions,
 #ifdef ENABLE_ASSERTIONS
             assert(foundDepsLabel != -1);
 #endif
-            // We save our dependency immediately here at the end of the target
-            // GEP and not waiting for the task submission as there might be
-            // more than one dependencies creation between the task alloc call
-            // and task sumbission call.
+            // We save our dependency immediately here at the end of the
+            // target GEP and not waiting for the task submission as there
+            // might be more than one dependencies creation between the
+            // task alloc call and task sumbission call.
             utils::log(errs(), 2, 1,
                        "Found a dependency. {Source:", foundDepsLabel,
                        ", Type:", label, "}");
             if (inDepsFlags.find(label) != inDepsFlags.end()) {
-              utils::log(errs(), 2, 1,
-                         "Assigning dependentTasks. Holder:", ompTaskEntryLamda,
+              utils::log(errs(), 2, 1, "Assigning dependentTasks. Holder:",
+                         ompTaskEntryLamdaName,
                          " input dep with:", foundDepsLabel);
-              dependentTasks[std::stoi(getOmpTaskEntryId(ompTaskEntryLamda))]
+              dependentTasks[std::stoi(
+                                 getOmpTaskEntryId(ompTaskEntryLamdaName))]
                   .first.insert(foundDepsLabel);
             } else if (outDepsFlags.find(label) != outDepsFlags.end()) {
-              utils::log(errs(), 2, 1,
-                         "Assigning dependentTasks. Holder:", ompTaskEntryLamda,
+              utils::log(errs(), 2, 1, "Assigning dependentTasks. Holder:",
+                         ompTaskEntryLamdaName,
                          " output dep with:", foundDepsLabel);
-              dependentTasks[std::stoi(getOmpTaskEntryId(ompTaskEntryLamda))]
+              dependentTasks[std::stoi(
+                                 getOmpTaskEntryId(ompTaskEntryLamdaName))]
                   .second.insert(foundDepsLabel);
             }
           }
@@ -425,8 +534,8 @@ void visitor(Function &F) {
   for (BasicBlock &BB : F) {
     utils::log(errs(), 0, 1,
                "\n################# START OF BLOCK ##################");
-    // For each basic block retrieves the instructions sequence defining a task
-    // creation and submission
+    // For each basic block retrieves the instructions sequence defining a
+    // task creation and submission
     const auto parsedInstructions = taskWithDepsInstructions(BB);
     utils::log(errs(), 1, 1, "Basic Block task with dependentTasks #:",
                parsedInstructions.size());
@@ -445,8 +554,18 @@ void visitor(Function &F) {
   utils::log(errs(), 1, 1, "\nDependency graph:");
   std::unordered_map<unsigned, std::vector<unsigned>> depsCount;
   for (auto &kv : dependentTasks) {
-    utils::log(errs(), 0, 1, "\nLambda name id:", kv.first);
-    utils::log(errs(), 0, 0, "In dependentTasks:");
+    const std::string formattedLambdaName = 'L' + std::to_string(kv.first);
+    utils::log(errs(), 0, 1, "\n\nLambda name id:", formattedLambdaName);
+    if (taskEntryInputs[kv.first].size()) {
+      utils::log(errs(), 0, 1, "Inputs:");
+      utils::log(errs(), 0, 0, "[");
+      for (auto &input : taskEntryInputs[kv.first]) {
+        const std::string formattedInput = '%' + std::to_string(input);
+        utils::log(errs(), 0, 0, formattedInput);
+      }
+      utils::log(errs(), 0, 1, "]");
+    }
+    utils::log(errs(), 0, 0, "Input dependencies:");
     for (auto &d : kv.second.first) {
       const std::string formatted = '%' + std::to_string(d);
       utils::log(errs(), 0, 0, formatted);
@@ -458,19 +577,20 @@ void visitor(Function &F) {
       }
     }
     if (uniqueParents.size()) {
-      utils::log(
-          errs(), 0, 1,
-          "\nThis task depends on the termination of the following parents:");
+      utils::log(errs(), 0, 1,
+                 "\nThis task depends on the termination of the "
+                 "following parents:");
       utils::log(errs(), 0, 0, "[");
       for (auto &parent : uniqueParents) {
-        utils::log(errs(), 0, 0, parent);
+        const std::string formattedLambdaName = 'L' + std::to_string(parent);
+        utils::log(errs(), 0, 0, formattedLambdaName);
       }
       utils::log(errs(), 0, 1, "]");
     } else {
       utils::log(errs(), 0, 1, " ");
     }
 
-    utils::log(errs(), 0, 0, "Out dependentTasks:");
+    utils::log(errs(), 0, 0, "Out dependencies:");
     for (auto &d : kv.second.second) {
       depsCount[d].push_back(kv.first);
       const std::string formatted = '%' + std::to_string(d);
@@ -478,10 +598,11 @@ void visitor(Function &F) {
     }
   }
 
-  utils::log(errs(), 0, 1, "\nFree tasks:");
+  utils::log(errs(), 0, 1, "\n\nFree tasks:");
   utils::log(errs(), 0, 0, "[");
   for (auto &task : freeTasks) {
-    utils::log(errs(), 0, 0, task);
+    const std::string formattedLambdaName = 'L' + std::to_string(task);
+    utils::log(errs(), 0, 0, formattedLambdaName);
   }
   utils::log(errs(), 0, 1, "]");
 
@@ -493,8 +614,8 @@ void visitor(Function &F) {
 struct OmpDependencyFinder : PassInfoMixin<OmpDependencyFinder> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
     // Cache the Function reference for recursive usage later inside the
-    // visitor. Some visitor fn may access some Function which has not been
-    // visited yet in the pass.
+    // visitor. Some visitor fn may access some Function which has not
+    // been visited yet in the pass.
     for (Function &F : M) {
       const auto fnName = F.getName().str();
       fnCache[fnName] = &F;
@@ -519,7 +640,7 @@ struct OmpDependencyFinder : PassInfoMixin<OmpDependencyFinder> {
 //-----------------------------------------------------------------------------
 // New PM Registration
 //-----------------------------------------------------------------------------
-llvm::PassPluginLibraryInfo getOmpDependencyFinderPlugInInfo() {
+PassPluginLibraryInfo getOmpDependencyFinderPlugInInfo() {
   return {LLVM_PLUGIN_API_VERSION, "OmpDependencyFinder", LLVM_VERSION_STRING,
           [](PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
@@ -534,10 +655,10 @@ llvm::PassPluginLibraryInfo getOmpDependencyFinderPlugInInfo() {
           }};
 }
 
-// This is the core interface for pass plugins. It guarantees that 'opt' will
-// be able to recognize OmpDependencyFinder when added to the pass pipeline on
-// the command line, i.e. via '-passes=fn-pass-and-analysis'
-extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
+// This is the core interface for pass plugins. It guarantees that 'opt'
+// will be able to recognize OmpDependencyFinder when added to the pass
+// pipeline on the command line, i.e. via '-passes=fn-pass-and-analysis'
+extern "C" LLVM_ATTRIBUTE_WEAK ::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
   return getOmpDependencyFinderPlugInInfo();
 }
