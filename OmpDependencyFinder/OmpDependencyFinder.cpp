@@ -40,9 +40,9 @@ using namespace llvm;
 // everything in an anonymous namespace.
 namespace {
 
-const std::string targetOpenOmpCall = "__kmpc_omp_task_alloc";
-const std::string targetCloseDepsOmpCall = "__kmpc_omp_task_with_deps";
-const std::string targetCloseOmpCall = "__kmpc_omp_task";
+const std::string targetOmpTaskAllocName = "__kmpc_omp_task_alloc";
+const std::string targetOmpTaskSubmissionDepsName = "__kmpc_omp_task_with_deps";
+const std::string targetOmpTaskSubmissionName = "__kmpc_omp_task";
 const std::string targetOmpDepsStructName = "struct.kmp_depend_info";
 const std::string targetOmpOutlinedFnNamePreifx = ".omp_outlined";
 
@@ -84,12 +84,12 @@ bool isTarget(Instruction const &inst, const uint8_t flag) {
   StringRef opcode_name = inst.getOpcodeName();
   if (auto *CI = dyn_cast<CallInst>(&inst)) {
     StringRef name = CI->getCalledFunction()->getName();
-    if (flag == OPEN_FLAG && name.data() == targetOpenOmpCall) {
+    if (flag == OPEN_FLAG && name.data() == targetOmpTaskAllocName) {
       return true;
     } else if (flag == CLOSE_FLAG_WITH_DEPS &&
-               name.data() == targetCloseDepsOmpCall) {
+               name.data() == targetOmpTaskSubmissionDepsName) {
       return true;
-    } else if (flag == CLOSE_FLAG && name.data() == targetCloseOmpCall) {
+    } else if (flag == CLOSE_FLAG && name.data() == targetOmpTaskSubmissionName) {
       return true;
     }
   }
@@ -314,11 +314,11 @@ void OmpDependenciesFinder(std::vector<Instruction *> instrunctions,
     if (CallInst *ompTaskAPICall = dyn_cast<llvm::CallInst>(inst)) {
       auto calledFnName = ompTaskAPICall->getCalledFunction()->getName().str();
       // It's not either a task creation open call or close call
-      if ((calledFnName != targetOpenOmpCall) &&
-          (calledFnName != targetCloseDepsOmpCall) &&
-          (calledFnName != targetCloseOmpCall)) {
+      if ((calledFnName != targetOmpTaskAllocName) &&
+          (calledFnName != targetOmpTaskSubmissionDepsName) &&
+          (calledFnName != targetOmpTaskSubmissionName)) {
         continue;
-      } else if (calledFnName == targetOpenOmpCall) {
+      } else if (calledFnName == targetOmpTaskAllocName) {
         // Extract the executed lamda reference
         const auto noOperands = ompTaskAPICall->getNumOperands();
         // The task entry lambda argmument is stored in the -2 index
@@ -328,7 +328,7 @@ void OmpDependenciesFinder(std::vector<Instruction *> instrunctions,
                    "Lambda called name:", ompTaskEntryLambdaArg->getName());
         ompTaskEntryLamda = ompTaskEntryLambdaArg->getName().str();
         continue;
-      } else if (calledFnName == targetCloseOmpCall) {
+      } else if (calledFnName == targetOmpTaskSubmissionName) {
         // When encountering a closing API call, if it's a task with no deps
         // save it
         freeTasks.insert(std::stoi(getOmpTaskEntryId(ompTaskEntryLamda)));
