@@ -44,6 +44,7 @@ const std::string targetOpenOmpCall = "__kmpc_omp_task_alloc";
 const std::string targetCloseDepsOmpCall = "__kmpc_omp_task_with_deps";
 const std::string targetCloseOmpCall = "__kmpc_omp_task";
 const std::string targetOmpDepsStructName = "struct.kmp_depend_info";
+const std::string targetOmpOutlinedFnNamePreifx = ".omp_outlined";
 
 constexpr uint8_t OPEN_FLAG = 0;
 constexpr uint8_t CLOSE_FLAG_WITH_DEPS = 1;
@@ -54,6 +55,8 @@ constexpr uint8_t CLOSE_FLAG = 2;
 // value.second: out_deps
 std::map<unsigned, std::pair<std::set<unsigned>, std::set<unsigned>>>
     dependentTasks;
+
+std::unordered_map<std::string, Function *> fnCache;
 
 std::unordered_set<unsigned> freeTasks;
 
@@ -401,6 +404,14 @@ void GEPDependencyFinder(std::vector<Instruction *> instrunctions,
 /// This method implements what the pass does
 /// @param F The @ref llvm:Function to visit
 void visitor(Function &F) {
+  const auto fnName = F.getName().str();
+  // Visit only functions of interest
+  if (fnName.find(targetOmpOutlinedFnNamePreifx) == std::string::npos) {
+    utils::log(errs(), 0, 1, "Skipping the visit of function called", fnName,
+               "as of not interest");
+    return;
+  }
+
   // Clear our dependentTasks holder for now as it will be only printed to
   // standard error
   dependentTasks.clear();
@@ -480,16 +491,27 @@ void visitor(Function &F) {
 
 // New PM implementation
 struct OmpDependencyFinder : PassInfoMixin<OmpDependencyFinder> {
-  // Main entry point, takes IR unit to run the pass on (&F) and the
-  // corresponding pass manager (to be queried if need be)
-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
-    visitor(F);
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    // Cache the Function reference for recursive usage later inside the
+    // visitor. Some visitor fn may access some Function which has not been
+    // visited yet in the pass.
+    for (Function &F : M) {
+      const auto fnName = F.getName().str();
+      fnCache[fnName] = &F;
+    }
+    for (auto &fn : fnCache) {
+      utils::log(errs(), 0, 1, "Cached fn name", fn.first);
+    }
+
+    utils::log(errs(), 0, 2, "\n\nStartig the Function visit for the Module",
+               M.getName());
+    // Iterate over all functions and visit them
+    for (Function &F : M) {
+      visitor(F);
+    }
     return PreservedAnalyses::all();
   }
 
-  // Without isRequired returning true, this pass will be skipped for functions
-  // decorated with the optnone LLVM attribute. Note that clang -O0 decorates
-  // all functions with optnone.
   static bool isRequired() { return true; }
 };
 } // namespace
@@ -501,10 +523,10 @@ llvm::PassPluginLibraryInfo getOmpDependencyFinderPlugInInfo() {
   return {LLVM_PLUGIN_API_VERSION, "OmpDependencyFinder", LLVM_VERSION_STRING,
           [](PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
-                [](StringRef Name, FunctionPassManager &FPM,
+                [](StringRef Name, ModulePassManager &MPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
-                  if (Name == "fn-pass-and-analysis") {
-                    FPM.addPass(OmpDependencyFinder());
+                  if (Name == "module-pass-and-analysis") {
+                    MPM.addPass(OmpDependencyFinder());
                     return true;
                   }
                   return false;
