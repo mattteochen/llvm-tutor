@@ -293,13 +293,13 @@ std::string getOmpTaskEntryId(std::string const &name) {
   return res;
 }
 
-/// Find an omp dependency from a list of instructions containing a sequnce of
-/// GEP calls. Other instructions might be present inside the input sequence and
-/// are filtered out.
+/// Find omp dependencies from a list of instructions containing a sequnce of
+/// omp task calls. Dependencies are discovered by leveraging GEP calls which populates omp deps structs.
+/// Other instructions might be present inside the input sequence and are filtered out.
 /// @param instructions A @ref std::vector of @ref llvm::Instruction
 /// @param targetStructName The struct name to search
 template <bool ShowInbounds = false>
-void GEPDependencyFinder(std::vector<Instruction *> instrunctions,
+void OmpDependenciesFinder(std::vector<Instruction *> instrunctions,
                          const std::string &targetStructName) {
   int foundDepsLabel = -1;
   std::string ompTaskEntryLamda = "";
@@ -435,7 +435,7 @@ void visitor(Function &F) {
       // for (auto &j : i) {
       //   errs() << *j << "\n";
       // }
-      GEPDependencyFinder(i, targetOmpDepsStructName);
+      OmpDependenciesFinder(i, targetOmpDepsStructName);
     }
     utils::log(errs(), 0, 1,
                "################## END OF BLOCK ###################");
