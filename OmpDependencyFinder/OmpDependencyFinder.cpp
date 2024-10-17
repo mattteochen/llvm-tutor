@@ -46,7 +46,7 @@ const std::string targetOmpTaskSubmissionDepsName = "__kmpc_omp_task_with_deps";
 const std::string targetOmpTaskSubmissionName = "__kmpc_omp_task";
 const std::string targetOmpDepsStructName = "struct.kmp_depend_info";
 const std::string targetOmpAnonStructName = "struct.anon";
-const std::string targetOmpOutlinedFnNamePreifx = ".omp_outlined";
+const std::string targetOmpOutlinedFnNamePrefix = ".omp_outlined";
 
 constexpr uint8_t OPEN_FLAG = 0;
 constexpr uint8_t CLOSE_FLAG_WITH_DEPS = 1;
@@ -61,16 +61,24 @@ void visitor(Function &F, std::vector<unsigned> const *entryPointInputs,
 std::map<unsigned, std::pair<std::set<unsigned>, std::set<unsigned>>>
     dependentTasks;
 
+// A map from the function name to its Function reference
 std::unordered_map<std::string, Function *> fnCache;
 
+// A map from a task entry ID to its input list
 std::unordered_map<unsigned, std::vector<unsigned>> taskEntryInputs;
 
+// A set containing free tasks with zero dependencies
 std::unordered_set<unsigned> freeTasks;
 
+// Taken from https://vscode.dev/github/llvm/llvm-project/blob/main/openmp/runtime/src/kmp.h#L2505
 const std::unordered_set<uint8_t> outDepsFlags = {2, 3};
 
+// Taken from https://vscode.dev/github/llvm/llvm-project/blob/main/openmp/runtime/src/kmp.h#L2505
 const std::unordered_set<uint8_t> inDepsFlags = {1};
 
+/// Retrieve the first available numerical label (IR proxy) after the given char
+/// @param str The input string referring to a @ref llvm::Instruction
+/// @param c The starting point char inside the input string
 std::string retrieveLabelFromChar(std::string const &str, const char c) {
   std::string parsed = "";
   unsigned i = 0;
@@ -84,10 +92,15 @@ std::string retrieveLabelFromChar(std::string const &str, const char c) {
   return parsed;
 }
 
+/// Retrieve the proxy label which is unnamed from an instruction string. This will retrieve effectively the first proxy being encountered inside the instruction string
+/// @param str A string representing a @ref llvm::Instruction
 std::string parseUnamedNameFromInstruction(std::string const &str) {
   return retrieveLabelFromChar(str, '%');
 };
 
+/// Retrieve the proxy label of a `ptrtoint` source
+/// @note This function does not check that the provided instruction is effectively a `ptrtoint` instruction
+/// @param str A string representing a @ref llvm::Instruction
 std::string parsePtrToIntSource(std::string const &str) {
   unsigned i = 0;
   while (i < str.size() && str[i] != '%') {
@@ -98,6 +111,11 @@ std::string parsePtrToIntSource(std::string const &str) {
 
 namespace utils {
 template <typename... T>
+/// Log util
+/// @tparam T A generic message type
+/// @param out The desired output stream
+/// @param indent The number of spaces to prefix the message content
+/// @param noNewLines The number of new lines to postfix the message content
 void log(raw_fd_ostream &out, uint8_t indent, uint8_t noNewLines, T &&...args) {
   std::string indentStr = "";
   for (uint8_t i = 0; i < indent; ++i) {
@@ -111,6 +129,10 @@ void log(raw_fd_ostream &out, uint8_t indent, uint8_t noNewLines, T &&...args) {
 }
 } // namespace utils
 
+/// Check if the instruction is part of a omp task call
+/// @param inst A @ref llvm::Instruction
+/// @param flag To control open or closing omp task calls (task alloc and task submission)
+/// @return The query result
 bool isTarget(Instruction const &inst, const uint8_t flag) {
   StringRef instruction_name = inst.getName();
   StringRef opcode_name = inst.getOpcodeName();
@@ -129,12 +151,12 @@ bool isTarget(Instruction const &inst, const uint8_t flag) {
   return false;
 }
 
-/// Retrive the instructions wrapping a task creation and submission
+/// Retrieve the instructions wrapping a task creation and submission
 /// A single basic block may contain multiple task creation instructions
 /// @param block A basic block
 /// @param includeAllBeforeTaskAllocation A flag to control if to include all
 /// instructions or not
-/// @return A list of possbile instructions containing task creation
+/// @return A list of possible instructions containing task creation
 std::vector<std::vector<Instruction *>>
 taskWithDepsInstructions(BasicBlock &block,
                          bool includeAllBeforeTaskAllocation) {
@@ -260,6 +282,11 @@ void GEPUses(const GetElementPtrInst *GEP) {
 /// Used in @ref GEPStoreUses
 enum StoreType { PointerStore, ValueStore };
 
+/// Recover the source pointer casted to int in a `ptrtoint` call.
+/// This function does a linear scan over the instructions and finds the associated `ptrtoint` call that matches the provided label
+/// @param instructions The instructions list
+/// @param label The result proxy where the `ptrtoint` operation is being saved
+/// @return The source pointer inside the `ptrtoint` call label
 std::string
 recoverPtrToIntSource(std::vector<Instruction *> const &instructions,
                       const std::string &label) {
@@ -284,7 +311,7 @@ recoverPtrToIntSource(std::vector<Instruction *> const &instructions,
 /// detect omp dependencies This function is specialized on IR of the omp task
 /// dependency scheduling
 /// @tparam T The type of storage we are looking for. @ref
-/// StoreType::PointerStore for dependencies souces and @ref
+/// StoreType::PointerStore for dependencies sources and @ref
 /// StoreType::ValueStore for dependencies types
 /// @param GEP A pointer to a get element pointer instance
 /// @return The label stored in the GEP reference
@@ -363,6 +390,9 @@ template <StoreType T> int GEPStoreUses(const GetElementPtrInst *GEP) {
   return -1;
 }
 
+/// Retrieve the omp task entry id from its whole name
+/// @param name The task entry point lambda name
+/// @return The ID associated with the task entry lambda
 std::string getOmpTaskEntryId(std::string const &name) {
   unsigned i = 0;
   // Prepend with a zero as the id will be converted to an unsigned. The first
@@ -382,9 +412,10 @@ std::string getOmpTaskEntryId(std::string const &name) {
 
 /// Find the inputs label to a omp task entry lambda
 /// @param I The omp task alloc instruction
+/// @param swapMap A map containing swap values for input proxy labels
 /// @return A @ref std::vector representing the inputs labels
 std::vector<unsigned> findTaskEntrypointInputs(
-    Instruction &I, std::unordered_map<unsigned, unsigned> const &labelMap) {
+    Instruction &I, std::unordered_map<unsigned, unsigned> const &swapMap) {
   std::vector<unsigned> inputs;
   auto cleanOperandString = [](std::string const &str) {
     unsigned index = 0;
@@ -400,7 +431,7 @@ std::vector<unsigned> findTaskEntrypointInputs(
   };
 
   auto saveStore = [&cleanOperandString, &inputs,
-                    &labelMap](auto *storeInst, const unsigned index) {
+                    &swapMap](auto *storeInst, const unsigned index) {
     std::string stringBuff;
     raw_string_ostream stream(stringBuff);
     storeInst->getOperand(index)->print(stream);
@@ -412,11 +443,13 @@ std::vector<unsigned> findTaskEntrypointInputs(
     const unsigned numericalValue = std::stoi(parsedOperand);
 
     // Swap the label if any replacement has been provided
-    inputs.push_back(labelMap.find(numericalValue) == labelMap.end()
+    inputs.push_back(swapMap.find(numericalValue) == swapMap.end()
                          ? numericalValue
-                         : labelMap.at(numericalValue));
+                         : swapMap.at(numericalValue));
   };
 
+  // The following block is quite nested but this is needed to retrieve a task entry lambda input parameters
+  // The current visits across llvm nodes (users) are defined on a IR produced by clang14
   if (auto *callInst = dyn_cast<CallInst>(&I)) {
     // Check if it's a call to __kmpc_omp_task_alloc
     assert(callInst->getCalledFunction()->getName() == targetOmpTaskAllocName);
@@ -445,6 +478,7 @@ std::vector<unsigned> findTaskEntrypointInputs(
             // handling wrt to the subsequent ones (clang14 IR)
             for (auto *user3 : loadedValue->users()) {
               if (auto *gepInst = dyn_cast<GetElementPtrInst>(user3)) {
+                // This block retrieves the inputs from the second one
                 for (auto *user4 : gepInst->users()) {
                   if (auto *bitCastInst2 = dyn_cast<BitCastInst>(user4)) {
                     for (auto *user5 : bitCastInst2->users()) {
@@ -457,6 +491,7 @@ std::vector<unsigned> findTaskEntrypointInputs(
                   }
                 }
               } else if (auto *bitCastInst3 = dyn_cast<BitCastInst>(user3)) {
+                // This block retrieves the first input
                 for (auto *user6 : bitCastInst3->users()) {
                   if (auto *storeInst = dyn_cast<StoreInst>(user6)) {
                     // Parse only the fist operand as it contains the
@@ -476,16 +511,15 @@ std::vector<unsigned> findTaskEntrypointInputs(
   return inputs;
 }
 
+/// Visit and find dependencies, inputs of children tasks (tasks created inside a task)
+/// @param inputs The children input list
+/// @param entryPointName The children task entry point lambda name
 void ompDependencyFinderChilds(std::vector<unsigned> const &inputs,
                                std::string const &entryPointName) {
   // Recover the cached function
   Function *fn = fnCache[entryPointName];
-  if (fn) {
-    utils::log(errs(), 2, 1, "Recovered child fn", fn->getName());
-  } else {
-    utils::log(errs(), 2, 1, "Entry point", entryPointName,
-               "not found in cache");
-  }
+  assert(fn);
+  utils::log(errs(), 2, 1, "Recovered child fn", fn->getName());
 
   // Log
   utils::log(errs(), 2, 1, "Inputs to the entry point:");
@@ -496,35 +530,37 @@ void ompDependencyFinderChilds(std::vector<unsigned> const &inputs,
   }
   utils::log(errs(), 2, 1, "]");
 
+  // Recursively visit this task entry point
   visitor(*fn, &inputs, false);
 }
 
-/// Find omp dependencies from a list of instructions containing a sequnce
+/// Find omp dependencies from a list of instructions containing a sequence
 /// of omp task calls. Dependencies are discovered by leveraging GEP calls
 /// which populates omp deps structs. Other instructions might be present
 /// inside the input sequence and are filtered out. This pass will also save
 /// for each omp task entry lambda the relative inputs.
 /// @param instructions A @ref std::vector of @ref Instruction
+/// @param allFnInstruction The complete @ref llvm::Instruction list of the current visited function
 /// @param targetStructName The struct name to search
 /// @param entryPointInputs A vector of the current task entry lambda inputs
 /// labels
 template <bool ShowInbounds = false>
-void ompDependenciesFinder(std::vector<Instruction *> const &instrunctions,
+void ompDependenciesFinder(std::vector<Instruction *> const &instructions,
                            std::vector<Instruction *> const &allFnInstructions,
                            const std::string &targetStructName,
                            std::vector<unsigned> const *entryPointInputs) {
   std::unordered_map<unsigned, unsigned> inputMap;
 
   int foundDepsLabel = -1;
-  std::string ompTaskEntryLamdaName = "";
+  std::string ompTaskEntryLambdaName = "";
   std::string stringBuff = "";
   raw_string_ostream stream(stringBuff);
 
-  utils::log(errs(), 2, 1, "\nFirst instruction:", *(instrunctions[0]));
+  utils::log(errs(), 2, 1, "\nFirst instruction:", *(instructions[0]));
   utils::log(errs(), 2, 1,
-             "Last instruction:", *(instrunctions[instrunctions.size() - 1]));
+             "Last instruction:", *(instructions[instructions.size() - 1]));
 
-  for (auto &inst : instrunctions) {
+  for (auto &inst : instructions) {
     if (CallInst *ompTaskAPICall = dyn_cast<CallInst>(inst)) {
       auto calledFnName = ompTaskAPICall->getCalledFunction()->getName().str();
       // It's not either a task creation open call or close call
@@ -535,36 +571,36 @@ void ompDependenciesFinder(std::vector<Instruction *> const &instrunctions,
       } else if (calledFnName == targetOmpTaskAllocName) {
         // Extract the executed lambda reference
         const auto noOperands = ompTaskAPICall->getNumOperands();
-        // The task entry lambda argmument is stored in the -2 index
+        // The task entry lambda arguments is stored in the -2 index
         Value *ompTaskEntryLambdaArg =
             ompTaskAPICall->getArgOperand(noOperands - 2);
         utils::log(errs(), 2, 1,
                    "Lambda called name:", ompTaskEntryLambdaArg->getName());
-        ompTaskEntryLamdaName = ompTaskEntryLambdaArg->getName().str();
+        ompTaskEntryLambdaName = ompTaskEntryLambdaArg->getName().str();
 
         // Find the task inputs. Dependencies data will figure in this
         // input vector
-        taskEntryInputs[std::stoi(getOmpTaskEntryId(ompTaskEntryLamdaName))] =
+        taskEntryInputs[std::stoi(getOmpTaskEntryId(ompTaskEntryLambdaName))] =
             findTaskEntrypointInputs(*inst, inputMap);
 
         continue;
       } else if (calledFnName == targetOmpTaskSubmissionName) {
         // When encountering a closing API call, if it's a task with no
         // deps save it
-        freeTasks.insert(std::stoi(getOmpTaskEntryId(ompTaskEntryLamdaName)));
-        // The inputs will have the orignal labels defined inside the parallel
+        freeTasks.insert(std::stoi(getOmpTaskEntryId(ompTaskEntryLambdaName)));
+        // The inputs will have the original labels defined inside the parallel
         // region entry point (omp_outlined) to have a consistent global
         // identification
         ompDependencyFinderChilds(taskEntryInputs[std::stoi(getOmpTaskEntryId(
-                                      ompTaskEntryLamdaName))],
-                                  ompTaskEntryLamdaName);
+                                      ompTaskEntryLambdaName))],
+                                  ompTaskEntryLambdaName);
       } else if (calledFnName == targetOmpTaskSubmissionDepsName) {
-        // The inputs will have the orignal labels defined inside the parallel
+        // The inputs will have the original labels defined inside the parallel
         // region entry point (omp_outlined) to have a consistent global
         // identification
         ompDependencyFinderChilds(taskEntryInputs[std::stoi(getOmpTaskEntryId(
-                                      ompTaskEntryLamdaName))],
-                                  ompTaskEntryLamdaName);
+                                      ompTaskEntryLambdaName))],
+                                  ompTaskEntryLambdaName);
       }
     }
 
@@ -581,9 +617,10 @@ void ompDependenciesFinder(std::vector<Instruction *> const &instrunctions,
         }
       }
 
-      // Check if the GEP does access the struct of interest
       if (GEPIsArrayOfSpecificStruct(GEP, targetStructName)) {
-        // kaixi: Do refer to technical docs for these accesses
+        // This block retrieves the dependency sources and ther types (in or out)
+
+        // KAIXI: Do refer to technical docs for these accesses
         auto lastIndex = GEP->getNumOperands();
         // We do expect structs with more than one field
 #ifdef ENABLE_ASSERTIONS
@@ -600,7 +637,7 @@ void ompDependenciesFinder(std::vector<Instruction *> const &instrunctions,
             int label = GEPStoreUses<StoreType::PointerStore>(GEP);
             // The label being stored in the GEP reference will be the output
             // alias from a `ptrtoint` instruction. The real data source is
-            // available inside the `ptrtoint` call which is before this point.
+            // available inside the `ptrtoint` call which is before this instruction.
             // Recover it.
             label = std::stoi(recoverPtrToIntSource(allFnInstructions,
                                                     std::to_string(label)));
@@ -620,28 +657,41 @@ void ompDependenciesFinder(std::vector<Instruction *> const &instrunctions,
             // We save our dependency immediately here at the end of the
             // target GEP and not waiting for the task submission as there
             // might be more than one dependencies creation between the
-            // task alloc call and task sumbission call.
+            // task alloc call and task submission call.
             utils::log(errs(), 2, 1,
                        "Found a dependency. {Source:", foundDepsLabel,
                        ", Type:", label, "}");
             if (inDepsFlags.find(label) != inDepsFlags.end()) {
               utils::log(errs(), 2, 1, "Assigning dependentTasks. Holder:",
-                         ompTaskEntryLamdaName,
+                         ompTaskEntryLambdaName,
                          " input dep with:", foundDepsLabel);
               dependentTasks[std::stoi(
-                                 getOmpTaskEntryId(ompTaskEntryLamdaName))]
+                                 getOmpTaskEntryId(ompTaskEntryLambdaName))]
                   .first.insert(foundDepsLabel);
             } else if (outDepsFlags.find(label) != outDepsFlags.end()) {
               utils::log(errs(), 2, 1, "Assigning dependentTasks. Holder:",
-                         ompTaskEntryLamdaName,
+                         ompTaskEntryLambdaName,
                          " output dep with:", foundDepsLabel);
               dependentTasks[std::stoi(
-                                 getOmpTaskEntryId(ompTaskEntryLamdaName))]
+                                 getOmpTaskEntryId(ompTaskEntryLambdaName))]
                   .second.insert(foundDepsLabel);
             }
           }
         }
       } else if (GEPIsSpecificStruct(GEP, targetOmpAnonStructName)) {
+        // This is needed to retrieve the inputs loaded from an anon struct
+        // These structs contain the inputs for the current task entry point. Their original reference are stored inside
+        // entryPointInputs which is a list of inputs for the current task entry point but filled at the parent level
+        //
+        // An example:
+        //
+        // %1 = task_alloc(..., task_entry_X)
+        // # compiler stores inside %1 the allocated struct inputs
+        // # The previous inputs are captured at previous stages of this pass an forwarded here inside the `entryPointInputs` variable
+        //
+        // void task_entry_X():
+        //    %1 = struct.anon
+        //    %2 = load type, struct.anon %1 <-- we have to match this proxy with its original proxy to have global identifiers
         utils::log(errs(), 2, 1,
                    "Found anon struct. #uses:", GEP->getNumUses());
         unsigned loads = 0;
@@ -732,7 +782,7 @@ void printDeps() {
 
 /// This method implements what the pass does
 /// @param F The @ref llvm:Function to visit
-/// @param entryPointInputs The current taks entry point lambda inputs arguments
+/// @param entryPointInputs The current task entry point lambda inputs arguments
 /// with labels referring to those present in the omp_outlined fn (original
 /// labels). Null pointer if this visitor call is called when visiting the
 /// omp_outlined itself
@@ -762,7 +812,7 @@ void visitor(Function &F, std::vector<unsigned> const *entryPointInputs,
                "\n################# START OF BLOCK ##################");
     // For each basic block retrieves the instructions sequence defining a task
     // creation and submission.  `clearDeps` is true when the visitor is called
-    // at omp_outlined leve. In this case we don't want to include all the
+    // at omp_outlined level. In this case we don't want to include all the
     // instructions before that task alloc.  In case this visitor is called in a
     // nested call we want to include the informations before the task alloc as
     // they contains data for task entry inputs and dependencies sources.
@@ -814,7 +864,7 @@ struct OmpDependencyFinder : PassInfoMixin<OmpDependencyFinder> {
     for (Function &F : M) {
       // Visit only functions of interest
       const auto fnName = F.getName().str();
-      if (fnName.find(targetOmpOutlinedFnNamePreifx) == std::string::npos) {
+      if (fnName.find(targetOmpOutlinedFnNamePrefix) == std::string::npos) {
         utils::log(errs(), 0, 1, "Skipping the visit of function called",
                    fnName, "as of not interest");
         continue;
