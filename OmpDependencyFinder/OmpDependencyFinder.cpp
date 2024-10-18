@@ -28,6 +28,7 @@
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Instruction.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
@@ -59,7 +60,7 @@ void visitor(Function &F, std::vector<unsigned> const *entryPointInputs,
 // key: fn ID
 // value.first: in_deps
 // value.second: out_deps
-std::map<unsigned, std::pair<std::set<unsigned>, std::set<unsigned>>>
+std::map<std::string, std::pair<std::set<unsigned>, std::set<unsigned>>>
     dependentTasks;
 
 // A map from the function name to its Function reference
@@ -114,6 +115,40 @@ std::string parsePtrToIntSource(std::string const &str) {
   }
   return retrieveLabelFromChar(str.substr(i + 1), '%');
 };
+
+/// Remove any whitespaces that prefix a string
+/// @param str The input string
+/// @return The modified string
+std::string removeEmptyPrefix(std::string const &str) {
+  std::string removed = "";
+  unsigned i = 0;
+  while (i < str.size() && str[i] == ' ') {
+    i++;
+  }
+  while (i < str.size()) {
+    removed += str[i++];
+  }
+  return removed;
+};
+
+/// Create an unique task id identified for task entry lambdas that are shared
+/// between different contexts
+/// @param id The original task entry id
+/// @param unique The unique identifier for the original id
+/// @return The unique task entry identifier
+std::string uniqueTaskEntryIdentifier(std::string const &id,
+                                      const unsigned unique) {
+  return id + "#" + std::to_string(unique);
+}
+
+/// Recover the original task entry id from an unique generated id. See @ref
+/// uniqueTaskEntryIdentifier
+/// @param uniqueId The unique task entry id
+/// @return The original task id without the unique identifier
+unsigned recoverLambdaIdFromUniqueId(std::string const &uniqueId) {
+  const auto pos = uniqueId.find('#');
+  return static_cast<unsigned>(std::stoi(uniqueId.substr(0, pos)));
+}
 
 namespace utils {
 template <typename... T>
@@ -322,8 +357,11 @@ recoverPtrToIntSource(std::vector<Instruction *> const &instructions,
 /// StoreType::PointerStore for dependencies sources and @ref
 /// StoreType::ValueStore for dependencies types
 /// @param GEP A pointer to a get element pointer instance
-/// @return The label stored in the GEP reference
-template <StoreType T> int GEPStoreUses(const GetElementPtrInst *GEP) {
+/// @return A vector containing pairs of the extracted stored proxy label and
+/// the store instruction as string itself
+template <StoreType T>
+std::vector<std::pair<int, std::string>>
+GEPStoreUses(const GetElementPtrInst *GEP) {
   // Retrieve the label of a pointer
   auto getPtrLabel = [](const std::string &str) {
     std::string label = "";
@@ -363,6 +401,7 @@ template <StoreType T> int GEPStoreUses(const GetElementPtrInst *GEP) {
     return label;
   };
 
+  std::vector<std::pair<int, std::string>> res;
   std::string stringBuff;
   raw_string_ostream stream(stringBuff);
 
@@ -392,10 +431,13 @@ template <StoreType T> int GEPStoreUses(const GetElementPtrInst *GEP) {
         label = getValueLabel(stringBuff);
       }
       stringBuff.clear();
-      return std::stoi(label);
+      storeInst->print(stream);
+      const std::string storeInstructionStr = removeEmptyPrefix(stringBuff);
+      res.push_back({std::stoi(label), storeInstructionStr});
+      stringBuff.clear();
     }
   }
-  return -1;
+  return res;
 }
 
 /// Retrieve the omp task entry id from its whole name
@@ -418,7 +460,7 @@ std::string getOmpTaskEntryId(std::string const &name) {
   return res;
 }
 
-/// Find the inputs label to a omp task entry lambda
+/// Find the input labels to a omp task entry lambda
 /// @param I The omp task alloc instruction
 /// @param swapMap A map containing swap values for input proxy labels
 /// @return A @ref std::vector representing the inputs labels
@@ -544,25 +586,112 @@ void ompDependencyFinderChilds(std::vector<unsigned> const &inputs,
   visitor(*fn, &inputs, false);
 }
 
+/// Compute all the GEP instructions to the target dependency struct by
+/// extracting dependency sources and types
+/// @param blockInstructions The instructions of a function block
+/// @param inputMap A label swap map
+/// @return The extracted informations as mapping
+std::unordered_map<std::string, std::pair<unsigned, unsigned>>
+storeGEPDepStructAccesses(
+    std::vector<Instruction *> const &blockInstructions,
+    std::unordered_map<unsigned, unsigned> const &inputMap) {
+  std::unordered_map<std::string, std::pair<unsigned, unsigned>>
+      precomputedDeps;
+  std::vector<unsigned> foundDepsLabels;
+  std::vector<std::string> depsStoreKeys;
+
+  // The following block relies on the fact that gep accesses to the same omp
+  // deps struct are ordered by field
+  for (auto &I : blockInstructions) {
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
+      if (GEPIsArrayOfSpecificStruct(GEP, targetOmpDepsStructName)) {
+        // This block retrieves the dependency sources and ther types (in or
+        // out)
+
+        // KAIXI: Do refer to technical docs for these accesses
+        auto lastIndex = GEP->getNumOperands();
+        // We do expect structs with more than one field
+#ifdef ENABLE_ASSERTIONS
+        assert(lastIndex > 0);
+#endif
+        lastIndex--;
+
+        Value *value = GEP->getOperand(lastIndex);
+        if (const ConstantInt *CI = dyn_cast<ConstantInt>(value)) {
+          const auto value = CI->getValue();
+          if (value == 0) {
+            utils::log(errs(), 2, 1,
+                       "GEP instruction on the dependency source field");
+            const auto uses = GEPStoreUses<StoreType::PointerStore>(GEP);
+            for (auto &use : uses) {
+              int label = use.first;
+              depsStoreKeys.push_back(use.second);
+              // The label being stored in the GEP reference will be the output
+              // alias from a `ptrtoint` instruction. The real data source is
+              // available inside the `ptrtoint` call which is before this
+              // instruction. Recover it.
+              label = std::stoi(recoverPtrToIntSource(blockInstructions,
+                                                      std::to_string(label)));
+              auto foundDepsLabel = label;
+              // Map the label to a parent source if available
+              if (inputMap.find(foundDepsLabel) != inputMap.end()) {
+                foundDepsLabel = inputMap.at(foundDepsLabel);
+              }
+              foundDepsLabels.push_back(foundDepsLabel);
+            }
+          } else if (value == 2) {
+            utils::log(errs(), 2, 1,
+                       "GEP instruction on the dependency type field");
+            const auto uses = GEPStoreUses<StoreType::ValueStore>(GEP);
+#ifdef ENABLE_ASSERTIONS
+            assert(foundDepsLabels.size());
+            assert(foundDepsLabels.size() == uses.size() &&
+                   uses.size() == depsStoreKeys.size());
+#endif
+            const unsigned size = uses.size();
+            for (unsigned i = 0; i < size; ++i) {
+              const int depType = uses[i].first;
+              precomputedDeps[depsStoreKeys[i]] = {foundDepsLabels[i], depType};
+            }
+            // GEPs in this current struct are sorted by field, reset the
+            // buffers for the next struct
+            foundDepsLabels.clear();
+            depsStoreKeys.clear();
+          }
+        }
+      }
+    }
+  }
+  return precomputedDeps;
+}
+
 /// Find omp dependencies from a list of instructions containing a sequence
 /// of omp task calls. Dependencies are discovered by leveraging GEP calls
 /// which populates omp deps structs. Other instructions might be present
 /// inside the input sequence and are filtered out. This pass will also save
 /// for each omp task entry lambda the relative inputs.
+/// GEP accesses to the resolved dependencies structs (with dependency sources
+/// and types) are provided as input.
 /// @param instructions A @ref std::vector of @ref Instruction
 /// @param allFnInstruction The complete @ref llvm::Instruction list of the
 /// current visited function
 /// @param targetStructName The struct name to search
 /// @param entryPointInputs A vector of the current task entry lambda inputs
-/// labels
+/// @param precomputedDeps A map between dependencies store instructions to the
+/// @param taskEntryPointCount A counting map from task entry name to its
+/// frequency in the current @ref llvm::Function block relative dependency
+/// source and type labels
 template <bool ShowInbounds = false>
-void ompDependenciesFinder(std::vector<Instruction *> const &instructions,
-                           std::vector<Instruction *> const &allFnInstructions,
-                           const std::string &targetStructName,
-                           std::vector<unsigned> const *entryPointInputs) {
+void ompDependenciesFinder(
+    std::vector<Instruction *> const &instructions,
+    std::vector<Instruction *> const &allFnInstructions,
+    const std::string &targetStructName,
+    std::vector<unsigned> const *entryPointInputs,
+    std::unordered_map<std::string, std::pair<unsigned, unsigned>> const
+        &precomputedDeps,
+    std::unordered_map<std::string, unsigned> const &taskEntryPointCount) {
   std::unordered_map<unsigned, unsigned> inputMap;
 
-  int foundDepsLabel = -1;
   std::string ompTaskEntryLambdaName = "";
   std::string stringBuff = "";
   raw_string_ostream stream(stringBuff);
@@ -578,7 +707,6 @@ void ompDependenciesFinder(std::vector<Instruction *> const &instructions,
       if ((calledFnName != targetOmpTaskAllocName) &&
           (calledFnName != targetOmpTaskSubmissionDepsName) &&
           (calledFnName != targetOmpTaskSubmissionName)) {
-        continue;
       } else if (calledFnName == targetOmpTaskAllocName) {
         // Extract the executed lambda reference
         const auto noOperands = ompTaskAPICall->getNumOperands();
@@ -589,12 +717,15 @@ void ompDependenciesFinder(std::vector<Instruction *> const &instructions,
                    "Lambda called name:", ompTaskEntryLambdaArg->getName());
         ompTaskEntryLambdaName = ompTaskEntryLambdaArg->getName().str();
 
+        inst->print(stream);
+        const std::string calledInstruction = stringBuff;
+        stringBuff.clear();
+        utils::log(errs(), 2, 1, "From instruction:", calledInstruction);
+
         // Find the task inputs. Dependencies data will figure in this
-        // input vector
+        // input vector as they must be shared variables from a parallel region
         taskEntryInputs[std::stoi(getOmpTaskEntryId(ompTaskEntryLambdaName))] =
             findTaskEntrypointInputs(*inst, inputMap);
-
-        continue;
       } else if (calledFnName == targetOmpTaskSubmissionName) {
         // When encountering a closing API call, if it's a task with no
         // deps save it
@@ -613,84 +744,47 @@ void ompDependenciesFinder(std::vector<Instruction *> const &instructions,
                                       ompTaskEntryLambdaName))],
                                   ompTaskEntryLambdaName);
       }
-    }
-
-    if (auto *GEP = dyn_cast<GetElementPtrInst>(inst)) {
-      GEP->print(stream);
-      utils::log(errs(), 2, 1,
-                 "Found a GetElementPtr instruction: ", stringBuff);
-      stringBuff.clear();
-
-      // Optionally, check if it's 'inbounds'
-      if constexpr (ShowInbounds) {
-        if (GEP->isInBounds()) {
-          utils::log(errs(), 2, 1, "GEP instruction is 'inbounds'");
+    } else if (auto *storeInst = dyn_cast<StoreInst>(inst)) {
+      storeInst->print(stream);
+      const std::string storeInstStr = removeEmptyPrefix(stringBuff);
+      if (precomputedDeps.find(storeInstStr) != precomputedDeps.end()) {
+        utils::log(errs(), 2, 1,
+                   "Found a precomputed dependency instruction. Assigning to "
+                   "the current task entry");
+#ifdef ENABLE_ASSERTIONS
+        assert(precomputedDeps.find(storeInstStr) != precomputedDeps.end());
+#endif
+        const unsigned depType = precomputedDeps.at(storeInstStr).second;
+        unsigned depSource = precomputedDeps.at(storeInstStr).first;
+        if (inputMap.find(depSource) != inputMap.end()) {
+          depSource = inputMap[depSource];
+        }
+        // As different task entry lambdas can be called on different
+        // dependencies we have to create an unique lambda identifier
+        // In case the lambda is called only once we retain the original id
+        std::string lambdaId;
+        if (taskEntryPointCount.find(ompTaskEntryLambdaName) !=
+                taskEntryPointCount.end() &&
+            taskEntryPointCount.at(ompTaskEntryLambdaName) > 1) {
+          lambdaId = uniqueTaskEntryIdentifier(
+              getOmpTaskEntryId(ompTaskEntryLambdaName), depSource);
+        } else {
+          lambdaId = getOmpTaskEntryId(ompTaskEntryLambdaName);
+        }
+        // Dispatch input deps and output deps
+        if (inDepsFlags.find(depType) != inDepsFlags.end()) {
+          utils::log(errs(), 2, 1, "Assigning dependent tasks. Holder:",
+                     ompTaskEntryLambdaName, " input dep with:", depSource);
+          dependentTasks[lambdaId].first.insert(depSource);
+        } else if (outDepsFlags.find(depType) != outDepsFlags.end()) {
+          utils::log(errs(), 2, 1, "Assigning dependent tasks. Holder:",
+                     ompTaskEntryLambdaName, " output dep with:", depSource);
+          dependentTasks[lambdaId].second.insert(depSource);
         }
       }
-
-      if (GEPIsArrayOfSpecificStruct(GEP, targetStructName)) {
-        // This block retrieves the dependency sources and ther types (in or
-        // out)
-
-        // KAIXI: Do refer to technical docs for these accesses
-        auto lastIndex = GEP->getNumOperands();
-        // We do expect structs with more than one field
-#ifdef ENABLE_ASSERTIONS
-        assert(lastIndex > 0);
-#endif
-        lastIndex--;
-
-        Value *value = GEP->getOperand(lastIndex);
-        if (const ConstantInt *CI = dyn_cast<ConstantInt>(value)) {
-          const auto value = CI->getValue();
-          if (value == 0) {
-            utils::log(errs(), 2, 1,
-                       "GEP instruction on the dependency source field");
-            int label = GEPStoreUses<StoreType::PointerStore>(GEP);
-            // The label being stored in the GEP reference will be the output
-            // alias from a `ptrtoint` instruction. The real data source is
-            // available inside the `ptrtoint` call which is before this
-            // instruction. Recover it.
-            label = std::stoi(recoverPtrToIntSource(allFnInstructions,
-                                                    std::to_string(label)));
-            foundDepsLabel = label;
-            // Map the label to a parent source if available
-            if (inputMap.find(foundDepsLabel) != inputMap.end()) {
-              foundDepsLabel = inputMap.at(foundDepsLabel);
-            }
-          } else if (value == 2) {
-            utils::log(errs(), 2, 1,
-                       "GEP instruction on the dependency type field");
-            const int label = GEPStoreUses<StoreType::ValueStore>(GEP);
-
-#ifdef ENABLE_ASSERTIONS
-            assert(foundDepsLabel != -1);
-#endif
-            // We save our dependency immediately here at the end of the
-            // target GEP and not waiting for the task submission as there
-            // might be more than one dependencies creation between the
-            // task alloc call and task submission call.
-            utils::log(errs(), 2, 1,
-                       "Found a dependency. {Source:", foundDepsLabel,
-                       ", Type:", label, "}");
-            if (inDepsFlags.find(label) != inDepsFlags.end()) {
-              utils::log(errs(), 2, 1, "Assigning dependentTasks. Holder:",
-                         ompTaskEntryLambdaName,
-                         " input dep with:", foundDepsLabel);
-              dependentTasks[std::stoi(
-                                 getOmpTaskEntryId(ompTaskEntryLambdaName))]
-                  .first.insert(foundDepsLabel);
-            } else if (outDepsFlags.find(label) != outDepsFlags.end()) {
-              utils::log(errs(), 2, 1, "Assigning dependentTasks. Holder:",
-                         ompTaskEntryLambdaName,
-                         " output dep with:", foundDepsLabel);
-              dependentTasks[std::stoi(
-                                 getOmpTaskEntryId(ompTaskEntryLambdaName))]
-                  .second.insert(foundDepsLabel);
-            }
-          }
-        }
-      } else if (GEPIsSpecificStruct(GEP, targetOmpAnonStructName)) {
+      stringBuff.clear();
+    } else if (auto *GEP = dyn_cast<GetElementPtrInst>(inst)) {
+      if (GEPIsSpecificStruct(GEP, targetOmpAnonStructName)) {
         // This is needed to retrieve the inputs loaded from an anon struct
         // These structs contain the inputs for the current task entry point.
         // Their original reference are stored inside entryPointInputs which is
@@ -741,14 +835,15 @@ void ompDependenciesFinder(std::vector<Instruction *> const &instructions,
 /// Print to standard error the parallel task region execution order (graph)
 void printDeps() {
   utils::log(errs(), 1, 1, "\nDependency graph:");
-  std::unordered_map<unsigned, std::vector<unsigned>> depsCount;
+  std::unordered_map<unsigned, std::vector<std::string>> depsCount;
   for (auto &kv : dependentTasks) {
-    const std::string formattedLambdaName = 'L' + std::to_string(kv.first);
+    const std::string formattedLambdaName = 'L' + (kv.first);
     utils::log(errs(), 0, 1, "\n\nLambda name id:", formattedLambdaName);
-    if (taskEntryInputs[kv.first].size()) {
+    if (taskEntryInputs[recoverLambdaIdFromUniqueId(kv.first)].size()) {
       utils::log(errs(), 0, 1, "Inputs:");
       utils::log(errs(), 0, 0, "[");
-      for (auto &input : taskEntryInputs[kv.first]) {
+      for (auto &input :
+           taskEntryInputs[recoverLambdaIdFromUniqueId(kv.first)]) {
         const std::string formattedInput = '%' + std::to_string(input);
         utils::log(errs(), 0, 0, formattedInput);
       }
@@ -759,7 +854,7 @@ void printDeps() {
       const std::string formatted = '%' + std::to_string(d);
       utils::log(errs(), 0, 0, formatted);
     }
-    std::set<unsigned> uniqueParents;
+    std::set<std::string> uniqueParents;
     for (auto &d : kv.second.first) {
       for (auto &parent : depsCount[d]) {
         uniqueParents.insert(parent);
@@ -771,7 +866,7 @@ void printDeps() {
                  "following parents:");
       utils::log(errs(), 0, 0, "[");
       for (auto &parent : uniqueParents) {
-        const std::string formattedLambdaName = 'L' + std::to_string(parent);
+        const std::string formattedLambdaName = 'L' + (parent);
         utils::log(errs(), 0, 0, formattedLambdaName);
       }
       utils::log(errs(), 0, 1, "]");
@@ -801,6 +896,32 @@ void printDeps() {
     utils::log(errs(), 0, 0, "])");
   }
   utils::log(errs(), 0, 1, "]");
+}
+
+/// Find for each task entry of a @ref llvm::Function block its usage count
+/// frequency
+/// @param instructions A list of @ref llvm::Instruction
+/// @return The frequency count as mapping
+std::unordered_map<std::string, unsigned>
+ompTaskEntryPointUsesCount(std::vector<Instruction *> const &instructions) {
+  std::unordered_map<std::string, unsigned> counts;
+  for (auto &I : instructions) {
+    if (CallInst *ompTaskAPICall = dyn_cast<CallInst>(I)) {
+      auto calledFnName = ompTaskAPICall->getCalledFunction()->getName().str();
+      // It's not either a task creation open call or close call
+      if (calledFnName == targetOmpTaskAllocName) {
+        // Extract the executed lambda reference
+        const auto noOperands = ompTaskAPICall->getNumOperands();
+        // The task entry lambda arguments is stored in the -2 index
+        Value *ompTaskEntryLambdaArg =
+            ompTaskAPICall->getArgOperand(noOperands - 2);
+        utils::log(errs(), 2, 1,
+                   "Lambda called name:", ompTaskEntryLambdaArg->getName());
+        counts[ompTaskEntryLambdaArg->getName().str()]++;
+      }
+    }
+  }
+  return counts;
 }
 
 /// This method implements what the pass does
@@ -839,21 +960,28 @@ void visitor(Function &F, std::vector<unsigned> const *entryPointInputs,
     // instructions before that task alloc.  In case this visitor is called in a
     // nested call we want to include the informations before the task alloc as
     // they contains data for task entry inputs and dependencies sources.
-    const auto parsedInstructions = taskWithDepsInstructions(BB, !clearDeps);
+    const auto parsedInstructions = taskWithDepsInstructions(BB, true);
     utils::log(errs(), 1, 1, "Basic Block task with dependentTasks #:",
                parsedInstructions.size());
 
+    // Recover all the block instructions
     std::vector<Instruction *> allFnInstructions;
     for (auto &i : parsedInstructions) {
       allFnInstructions.insert(allFnInstructions.end(), i.begin(), i.end());
     }
+
+    const auto precomputedDeps =
+        storeGEPDepStructAccesses(allFnInstructions, {});
+    const auto taskEntryPointCount =
+        ompTaskEntryPointUsesCount(allFnInstructions);
 
     for (auto &i : parsedInstructions) {
       // for (auto &j : i) {
       //   errs() << *j << "\n";
       // }
       ompDependenciesFinder(i, allFnInstructions, targetOmpDepsStructName,
-                            entryPointInputs);
+                            entryPointInputs, precomputedDeps,
+                            taskEntryPointCount);
     }
     utils::log(errs(), 0, 1,
                "################## END OF BLOCK ###################");
